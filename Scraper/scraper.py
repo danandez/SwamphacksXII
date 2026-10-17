@@ -1,29 +1,23 @@
 """Step 1: collect Instagram post metadata for selected UF organizations.
 
-Install: python -m pip install instaloader google-genai
+Install: python -m pip install "apify-client>=3,<4" google-genai
 Run from the project folder: python Scraper/scraper.py
 Test Gemini: python Scraper/scraper.py --images flyer.jpg --caption "Club meeting"
 """
 
 import argparse  # Reads terminal options such as --images.
 import json  # Turns Python dictionaries into JSON text.
-import os  # Reads optional login settings from environment variables.
+import os  # Reads API keys from environment variables.
 import sys  # Sends progress messages to stderr, separate from JSON output.
-from datetime import timezone
-from itertools import islice  # Limits how many posts we request.
 from pathlib import Path  # Reads saved image files into memory.
-
-import instaloader
 
 
 # Add club usernames here, without the @ symbol, as quoted strings.
-CLUB_HANDLES = ["UF Association for Computing Machinery"]
+CLUB_HANDLES = ["uf.acm"]
 POSTS_PER_ACCOUNT = 5
 
-# Optional: reuse a session created with: instaloader --login YOUR_USERNAME
-# No password or session contents belong in this source file.
-INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME")
-INSTAGRAM_SESSION_FILE = os.getenv("INSTAGRAM_SESSION_FILE")
+# Set APIFY_API_TOKEN in your terminal; no Instagram login session is used.
+APIFY_ACTOR = "apify/instagram-scraper"
 
 
 # --- Gemini: read images and return event information ---
@@ -100,14 +94,20 @@ def extract_events(images, caption=""):
 
 
 def get_image_urls(post):
-    """Return photo URLs, including carousel photos, while skipping videos."""
-    # Instagram calls a carousel (a post with multiple slides) a sidecar.
-    if post.typename == "GraphSidecar":
-        return [node.display_url for node in post.get_sidecar_nodes()
-                if not node.is_video]
-    if post.is_video:
+    """Read Apify photo URLs, skipping videos and their thumbnail images."""
+    if post.get("type") == "Video":
         return []
-    return [post.url]
+    # Carousel children describe individual slides, including their media type.
+    children = post.get("childPosts") or []
+    if children:
+        urls = [child.get("displayUrl") for child in children
+                if child.get("type") == "Image"]
+    elif post.get("type") == "Image":
+        urls = [post.get("displayUrl")]
+    else:
+        # Do not guess whether an unidentified carousel slide is a video.
+        urls = []
+    return list(dict.fromkeys(url for url in urls if url))
 
 
 def collect_posts():
@@ -118,44 +118,66 @@ def collect_posts():
                                  "Add club usernames to CLUB_HANDLES first."})
         return result
 
-    # Quiet mode keeps stdout available for JSON. No media is saved to disk.
-    loader = instaloader.Instaloader(quiet=True, max_connection_attempts=1)
+    token = os.getenv("APIFY_API_TOKEN")
+    if not token:
+        result["errors"].append({"stage": "settings", "message":
+                                 "Set APIFY_API_TOKEN in your terminal first."})
+        return result
+    # Import here so local Gemini tests do not require the Apify package.
     try:
-        if INSTAGRAM_USERNAME:
-            try:
-                loader.load_session_from_file(
-                    INSTAGRAM_USERNAME, filename=INSTAGRAM_SESSION_FILE
-                )
-            except (OSError, instaloader.InstaloaderException) as error:
-                result["errors"].append({"stage": "login", "message": str(error)})
-                return result
+        from apify_client import ApifyClient
+    except ImportError:
+        result["errors"].append({"stage": "settings", "message":
+                                 "Install Apify: python -m pip install apify-client"})
+        return result
 
-        for handle in CLUB_HANDLES:
-            print(f"Collecting posts from @{handle}...", file=sys.stderr)
-            try:
-                profile = instaloader.Profile.from_username(loader.context, handle)
-                # Inspect at most five posts, in Instagram's returned order.
-                # Video-only posts count toward the limit but are skipped.
-                for post in islice(profile.get_posts(), POSTS_PER_ACCOUNT):
-                    image_urls = get_image_urls(post)
-                    if not image_urls:
-                        continue
-                    result["posts"].append({
+    client = ApifyClient(token)
+    for handle in CLUB_HANDLES:
+        print(f"Collecting posts from @{handle} through Apify...", file=sys.stderr)
+        try:
+            # Each call starts a hosted job and may consume Apify credits.
+            run = client.actor(APIFY_ACTOR).call(run_input={
+                "directUrls": [f"https://www.instagram.com/{handle}/"],
+                "resultsType": "posts",
+                "resultsLimit": POSTS_PER_ACCOUNT,
+            })
+            # Apify SDK 3 returns a Run object, accessed with dots, not .get().
+            if not run or run.status != "SUCCEEDED":
+                status = run.status if run else "UNKNOWN"
+                result["errors"].append({"stage": "collection",
+                    "organization_handle": handle,
+                    "message": f"Apify run did not succeed: {status}"})
+                continue
+            # A dataset is Apify's stored list of results for this run.
+            for post in client.dataset(run.default_dataset_id).iterate_items():
+                if post.get("error"):
+                    result["errors"].append({"stage": "collection",
                         "organization_handle": handle,
-                        "post_url": f"https://www.instagram.com/p/{post.shortcode}/",
-                        "caption": post.caption or "",
-                        # This is when the post was published, not the event date.
-                        "posted_at": post.date_utc.replace(tzinfo=timezone.utc).isoformat(),
-                        "image_urls": image_urls,
-                    })
-            except instaloader.InstaloaderException as error:
-                # Preserve collected posts and move on to the next account.
-                result["errors"].append({
-                    "stage": "collection", "organization_handle": handle,
-                    "message": f"Instagram collection failed: {error}",
+                        "message": str(post.get("errorDescription") or post["error"])})
+                    continue
+                image_urls = get_image_urls(post)
+                if not image_urls:
+                    if post.get("type") != "Video":
+                        result["errors"].append({"stage": "collection",
+                            "organization_handle": handle,
+                            "message": "Post has no identifiable photo URLs.",
+                            "post_url": post.get("url")})
+                    continue
+                result["posts"].append({
+                    "organization_handle": handle,
+                    "post_url": post.get("url"),
+                    "caption": post.get("caption") or "",
+                    # Publication time is not the event's date.
+                    "posted_at": post.get("timestamp"),
+                    "image_urls": image_urls,
                 })
-    finally:
-        loader.close()
+        except Exception as error:
+            # Keep earlier results; avoid exception details containing credentials.
+            result["errors"].append({
+                "stage": "collection", "organization_handle": handle,
+                "message": f"Apify collection failed ({type(error).__name__}); "
+                           "check your token, credits, and Apify run logs.",
+            })
     return result
 
 
